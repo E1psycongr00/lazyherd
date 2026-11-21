@@ -88,7 +88,10 @@ Left to right, top to bottom. Colors are theme tokens, so it follows any theme.
 - **Right-click** any tree row, search result or the header path: copies the
   full path (backslashes on local Windows, quoted when it has spaces) and
   shows a "경로 복사됨" (path copied) toast. Paste it to an agent.
-- **Usage pills**: refreshed every 60 s. Percent color: `ansi2` green below
+- **Usage pills**: refreshed right after each request: the mod watches
+  `~/.claude` (reacting only to `usage-limits.json`) and `~/.codex/sessions`,
+  at most every 0.5 s for Claude and 3 s for Codex. A 60 s timer redraws reset
+  times and polls instead when a folder can't be watched. Percent color: `ansi2` green below
   60%, `ansi3` yellow from 60%, `ansi1` red from 85%. A window whose reset
   time has passed shows 0%. A tool with no data is simply not shown.
 - **Usage hover card** (after 250 ms, anchored bottom-left, 280px,
@@ -112,13 +115,16 @@ Left to right, top to bottom. Colors are theme tokens, so it follows any theme.
   `powershell` (or `sh` elsewhere) to list folders. Reads only inside the
   focused folder.
 - `mods/usage/`: reads `~/.claude/usage-limits.json` with `readTextFile` and
-  runs `codex-usage.ps1` with `exec("powershell", …)`. Icons are Herdr's own
+  runs `codex-usage.ps1` with `exec("powershell", …)`; `watchFolder` tells it
+  when either changed. Icons are Herdr's own
   `icons/claude.svg` and `icons/codex.svg`. No network access.
 - `mods/usage/claude-statusline.js`: a Claude Code status line that, besides
   printing model / folder / project / output style, saves the `rate_limits`
   Claude Code passes it to `~/.claude/usage-limits.json` (atomically).
 - `mods/usage/codex-usage.ps1`: finds the newest `rate_limits` entry in the
-  last 5 session logs under `~/.codex/sessions` and prints it as JSON.
+  given session log (`-Path`), or else in the last 5 under `~/.codex/sessions`,
+  and prints it as JSON. Logs grow to tens of MB, so it reads each from the
+  end (1, 8, then 64 MB) instead of the whole file.
 
 ## Watch out
 

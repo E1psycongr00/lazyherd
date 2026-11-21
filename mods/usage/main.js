@@ -1,13 +1,19 @@
 // Claude and Codex subscription usage (5-hour and weekly windows) for the status bar.
 // Claude's comes from ~/.claude/usage-limits.json, written by the Claude Code status line
 // (~/.claude/statusline.js). Codex's comes from its newest session log (codex-usage.ps1).
-// A window whose reset time has passed counts as 0%. Hovering a group shows a card
-// with each window's usage and when it resets.
+// Both are written after every request, so each is reloaded when its folder changes
+// (at most once per THROTTLE); the minute timer redraws reset times and is the fallback
+// when a folder can't be watched. A window whose reset time has passed counts as 0%.
+// Hovering a group shows a card with each window's usage and when it resets.
 import { View, div, image } from "gpui-kit";
 import { h_flex, v_flex, HoverCard } from "gpui-base";
-import { exec, readTextFile, home, appHome, theme } from "herdr";
+import { exec, readTextFile, watchFolder, home, appHome, theme } from "herdr";
 
 const EVERY = 60000;
+// Claude writes one small file per request; Codex appends to its log many times per answer,
+// and each Codex load starts PowerShell (~0.7 s), so it waits longer.
+const THROTTLE = { claude: 500, codex: 3000 };
+const norm = p => p.replace(/\\/g, "/").toLowerCase();
 const DAYS = "일월화수목금토";
 const pad = n => String(n).padStart(2, "0");
 
@@ -33,33 +39,69 @@ function ago(s, now) {
 export default class Usage extends View {
   init(_props, cx) {
     this.claude = null; this.codex = null;
-    this.load(cx);
-    cx.timer.every(EVERY, cx => this.load(cx));
+    this.watching = { claude: false, codex: false };
+    cx.spawn(async cx => { await this.loadClaude(); cx.notify(); });
+    cx.spawn(async cx => { await this.loadCodex(); cx.notify(); });
+    this.watch("claude", `${home()}/.claude`, cx, async paths => {
+      if (paths.some(p => p.includes("usage-limits.json"))) await this.loadClaude();
+    });
+    this.watch("codex", `${home()}/.codex/sessions`, cx, async paths => {
+      const logs = [...new Set(paths.filter(p => p.endsWith(".jsonl")))];
+      if (logs.length) await this.loadCodex(logs.length === 1 ? logs[0] : null);
+    });
+    cx.timer.every(EVERY, cx => cx.spawn(async cx => {
+      if (!this.watching.claude) await this.loadClaude();
+      if (!this.watching.codex) await this.loadCodex();
+      cx.notify();
+    }));
   }
 
-  load(cx) {
+  // Reloads on every batch of changes under dir. Changes that land during the pause stay
+  // pending and arrive as the next batch, so a busy folder loads once per THROTTLE.
+  watch(id, dir, cx, onChange) {
+    const root = norm(dir);
     cx.spawn(async cx => {
-      try {
-        const text = await readTextFile(`${home()}/.claude/usage-limits.json`);
-        const j = text ? JSON.parse(text) : null;
-        this.claude = j && {
-          windows: [["5h", "5시간", j.five_hour?.used_percentage, j.five_hour?.resets_at], ["주", "주간", j.seven_day?.used_percentage, j.seven_day?.resets_at]],
-          updated: j.updated_at,
-        };
-      } catch { this.claude = null; }
-      try {
-        const r = await exec("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", `${appHome()}/mods/usage/codex-usage.ps1`]);
-        const j = r.code === 0 && r.stdout.trim() ? JSON.parse(r.stdout) : null;
-        this.codex = j && {
-          windows: [["5h", "5시간", j.primary?.used_percent, j.primary?.resets_at], ["주", "주간", j.secondary?.used_percent, j.secondary?.resets_at]],
-          updated: j.updated_at,
-          // Shown only when there is a balance (or unlimited credits).
-          credits: j.credits?.unlimited ? { unlimited: true }
-            : j.credits?.has_credits && Number(j.credits.balance) > 0 ? { balance: Number(j.credits.balance) } : null,
-        };
-      } catch { this.codex = null; }
-      cx.notify();
+      for (;;) {
+        let paths;
+        this.watching[id] = true;
+        try { paths = (await watchFolder(dir)).map(norm); }
+        catch { this.watching[id] = false; return; }  // the minute timer takes over
+        if (!paths.length) return;  // cancelled: this copy is closing
+        // A batch with the root means too much changed to list: reload from scratch.
+        if (paths.some(p => p.replace(/\/$/, "") === root)) await (id === "claude" ? this.loadClaude() : this.loadCodex());
+        else await onChange(paths);
+        cx.notify();
+        await new Promise(done => cx.timer.after(THROTTLE[id], () => done()));
+      }
     });
+  }
+
+  async loadClaude() {
+    try {
+      const text = await readTextFile(`${home()}/.claude/usage-limits.json`);
+      const j = text ? JSON.parse(text) : null;
+      this.claude = j && {
+        windows: [["5h", "5시간", j.five_hour?.used_percentage, j.five_hour?.resets_at], ["주", "주간", j.seven_day?.used_percentage, j.seven_day?.resets_at]],
+        updated: j.updated_at,
+      };
+    } catch { this.claude = null; }
+  }
+
+  // With a log path, reads just that log; another session's older log never replaces newer numbers.
+  async loadCodex(log) {
+    try {
+      const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", `${appHome()}/mods/usage/codex-usage.ps1`];
+      const r = await exec("powershell", log ? [...args, "-Path", log] : args);
+      const j = r.code === 0 && r.stdout.trim() ? JSON.parse(r.stdout) : null;
+      if (log && (!j || (this.codex?.updated && j.updated_at < this.codex.updated))) return;
+      this.codex = j && {
+        windows: [["5h", "5시간", j.primary?.used_percent, j.primary?.resets_at], ["주", "주간", j.secondary?.used_percent, j.secondary?.resets_at]],
+        updated: j.updated_at,
+        // Shown only when there is a balance (or unlimited credits).
+        credits: j.credits?.unlimited ? { unlimited: true }
+          : j.credits?.has_credits && Number(j.credits.balance) > 0 ? { balance: Number(j.credits.balance) } : null,
+      };
+    } catch { if (!log) this.codex = null; }
   }
 
   render() {
