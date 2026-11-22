@@ -69,7 +69,8 @@ Left to right, top to bottom. Colors are theme tokens, so it follows any theme.
 - **Sidebar**: the toggle (or `ctrl-shift-b`) folds it to a 44px rail (76px
   on macOS) and back to the width it had.
 - **Side panel**: the Files / Changes buttons in the tab bar open it on that
-  block; it is remembered per space.
+  block; it is remembered per space. `ctrl-shift-y` (`keys.json`,
+  `layout:lazyherd` section) opens or closes it on the block shown last.
 - **Files follows focus**: it always shows the focused pane's folder (also
   on remote machines). It refreshes every 10 s and whenever the local folder
   changes, and remembers which folders were open and which file was shown
@@ -175,6 +176,9 @@ Left to right, top to bottom. Colors are theme tokens, so it follows any theme.
   `name:line` matches, and Enter opens the selected one.
 - Right-clicking a file puts its full path on the clipboard and shows the
   toast.
+- `ctrl-shift-y` opens and closes the side panel; with Files shown, Alt+L
+  from the rightmost pane puts a cursor row in the tree, the arrows move it
+  and open folders, and Escape goes back to the terminal.
 - After a Claude Code reply with the status line set up,
   `~/.claude/usage-limits.json` exists and the Claude pill shows `5h` and
   `주` percentages; hovering it shows the reset times.

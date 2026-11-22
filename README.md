@@ -13,8 +13,17 @@ Ask the agent in your Herdr to add it:
 > Add the Herdr layout from https://github.com/E1psycongr00/lazyherd
 
 Or by hand: copy `layouts/lazyherd.json` into `~/.config/herdr-app/layouts/`
-and `mods/my-files/`, `mods/usage/` into `~/.config/herdr-app/mods/`, then
-switch to it in Settings or with `herdr-app do layout.switch --name lazyherd`.
+and `mods/my-files/`, `mods/usage/` into `~/.config/herdr-app/mods/`, add the
+`layout:lazyherd` section of `keys.json` to `~/.config/herdr-app/keys.json`,
+then switch to it in Settings or with `herdr-app do layout.switch --name lazyherd`.
+
+## Keys
+
+- `Ctrl+Shift+Y` opens or closes the right panel (Files or Changes, whichever
+  was shown last); the tab bar buttons do the same.
+- `Alt+L` from the rightmost pane moves into Files. In the tree, ↑ / ↓ move,
+  → / ← open and close folders, Enter previews a file, `/` or ↑ on the first
+  row goes to the search box, and Escape goes back to the terminal.
 
 - File content search (`#text`) needs [ripgrep](https://github.com/BurntSushi/ripgrep).
 - Claude usage needs the bundled Claude Code status line

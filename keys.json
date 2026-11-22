@@ -1,0 +1,5 @@
+{
+  "layout:lazyherd": {
+    "ctrl-shift-y": "layout.toggle:panel"
+  }
+}
