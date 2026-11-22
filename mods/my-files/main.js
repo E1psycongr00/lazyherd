@@ -1,7 +1,7 @@
 // A lazy file browser for the focused pane's folder, with bounded read-only previews.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, InputState, Input, ScrollHandle } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, notify } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, notify, nextCommand, run } from "herdr";
 
 function location() {
   const space = spaces().find(s => s.active), f = focused();
@@ -13,8 +13,29 @@ const key = () => JSON.stringify(location());
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
 const PER_FOLDER = 500, TOTAL = 5000;
 
+// Windows: cmd's dir answers in ~0.1 s where starting PowerShell takes ~0.5 s. The folder is
+// the working directory and the script is fixed text, so no name reaches cmd's parser. dir
+// writes the console code page, so the inner cmd starts after chcp 65001 to print UTF-8.
+// Sections: folders, links and other reparse points (junctions, OneDrive), files.
+const DIR_SCRIPT = "chcp 65001>nul&cmd /d /c dir /b /a:d-l 2^>nul^&echo :^&dir /b /a:dl 2^>nul^&echo :^&dir /b /a:-d 2^>nul";
+async function cmdDirectory(path, on) {
+  const r = await exec("cmd", ["/d", "/s", "/c", DIR_SCRIPT], { cwd: path, on }).catch(() => null);
+  if (!r || r.stdout.includes("�")) return null; // not started, or not UTF-8 after all
+  const sections = [[]];
+  for (const line of r.stdout.split(/\r?\n/)) {
+    if (line === ":") sections.push([]);
+    else if (line) sections.at(-1).push(line);
+  }
+  // Links need PowerShell to tell a dangling one from a folder.
+  if (sections.length !== 3 || sections[1].length) return null;
+  return [...sections[0].map(name => ({ name, dir: true })), ...sections[2].map(name => ({ name, dir: false }))]
+    .filter(e => e.name !== ".git").slice(0, 501);
+}
+
 async function directory(path, on) {
   const windowsDirectory = async () => {
+    const fast = await cmdDirectory(path, on);
+    if (fast) return fast;
     // Windows PowerShell otherwise uses the console code page; exec decodes UTF-8.
     // Links keep directory attributes even when dangling; check their target.
     // Other reparse points (OneDrive's folders) have no LinkType and are folders.
@@ -108,11 +129,20 @@ export default class Files extends View {
       cx.notify();
     });
     this.input.on("submit", (_e, cx) => { const hit = this.results()[this.at]; if (hit) this.open(hit, cx); cx.notify(); });
-    this.scroll = ScrollHandle.new();
+    this.scroll = ScrollHandle.new(); this.treeScroll = ScrollHandle.new();
+    this.handle = cx.focus_handle(); this.cursor = null;
     this.saved = new Map();
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
     this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
+    // pane.go (Alt+H/J/K/L) lands here: type into the search box, or scroll an open preview.
+    cx.spawn(async cx => {
+      for (;;) {
+        if (await nextCommand() !== "focus") continue;
+        if (!this.file) this.focusHome(); else if (this.code) this.code.focus(); else this.handle.focus();
+        cx.notify();
+      }
+    });
   }
 
   watch(root, cx) {
@@ -192,7 +222,8 @@ export default class Files extends View {
     const { on, cwd: root } = context;
     const entries = await directory(path ? `${root}/${path}` : root, on);
     if (!this.current(context) || (path && !this.folders.has(path))) return;
-    const used = [...this.entries.entries()].filter(([p]) => p !== path).reduce((n, [, e]) => n + e.length, 0);
+    // Closed folders keep their listing for a quick reopen, but only open ones count.
+    const used = [...this.entries.entries()].filter(([p]) => p !== path && (!p || this.folders.has(p))).reduce((n, [, e]) => n + e.length, 0);
     this.entries.set(path, entries.slice(0, Math.max(0, Math.min(PER_FOLDER, TOTAL - used))).sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name)));
     if (entries.length > PER_FOLDER || used + entries.length > TOTAL) this.limited = true;
   }
@@ -203,7 +234,7 @@ export default class Files extends View {
       if (this.context) this.saved.set(this.context.key, { folders: this.folders, file: this.file });
       const saved = this.saved.get(next);
       this.context = { key: next, cwd, on }; this.root = cwd; this.on = on; this.entries = new Map(); this.folders = new Set(saved?.folders);
-      this.pending = new Set(); this.marks = {}; this.show(null); this.watched = null; this.error = null; this.limited = false;
+      this.pending = new Set(); this.marks = {}; this.show(null); this.watched = null; this.error = null; this.limited = false; this.cursor = null;
       this.loading = false;
       this.index = null; this.indexError = null; this.indexing = false; this.at = 0;
       if (saved?.file) this.show(saved.file, cx);
@@ -219,7 +250,13 @@ export default class Files extends View {
       try {
         for (const path of ["", ...this.folders]) {
           if (!this.current(context)) return;
-          await this.loadFolder(path, context);
+          if (path && !this.folders.has(path)) continue; // collapsed along with a vanished parent
+          try { await this.loadFolder(path, context); }
+          catch (e) {
+            // An open folder that was renamed or deleted: forget it instead of failing the whole tree.
+            if (!path || this.listed(path)) throw e;
+            this.collapse(path);
+          }
         }
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }).catch(() => null);
         const marks = {};
@@ -240,15 +277,26 @@ export default class Files extends View {
     });
   }
 
+  // Whether the parent's latest listing still has this path as a folder.
+  listed(path) {
+    const cut = path.lastIndexOf("/"), parent = cut < 0 ? "" : path.slice(0, cut), name = path.slice(cut + 1);
+    return Boolean(this.entries.get(parent)?.some(e => e.dir && e.name === name));
+  }
+
+  collapse(path) {
+    for (const folder of [...this.folders]) if (folder === path || folder.startsWith(path + "/")) {
+      this.folders.delete(folder);
+      this.entries.delete(folder);
+    }
+  }
+
   toggle(path, cx) {
     if (this.folders.has(path)) {
-      for (const folder of [...this.folders]) if (folder === path || folder.startsWith(path + "/")) {
-        this.folders.delete(folder);
-        this.entries.delete(folder);
-      }
+      // Closing keeps the listings, so reopening shows them at once while it lists again.
+      for (const folder of [...this.folders]) if (folder === path || folder.startsWith(path + "/")) this.folders.delete(folder);
     } else {
       this.folders.add(path);
-      if (!this.entries.has(path) && !this.pending.has(path)) {
+      if (!this.pending.has(path)) {
         const context = this.context;
         this.pending.add(path);
         cx.spawn(async cx => {
@@ -293,21 +341,67 @@ export default class Files extends View {
     notify({ title: "경로 복사됨", body: text, level: "success", timeout: 2500 });
   }
 
-  rows(prefix, depth, out, t) {
+  // The tree's shown rows in order, each open folder followed by its contents.
+  visible(prefix = "", depth = 0, out = []) {
     if (out.length >= TOTAL || depth > 40) return out;
     for (const entry of this.entries.get(prefix) ?? []) {
       if (out.length >= TOTAL) break;
-      const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[`${this.root}/${path}`];
-      out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
-        .on_click((_e, cx) => entry.dir ? this.toggle(path, cx) : this.show(path, cx))
+      const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+      out.push({ path, entry, depth });
+      if (entry.dir && this.folders.has(path)) this.visible(path, depth + 1, out);
+    }
+    return out;
+  }
+
+  // Where the keyboard goes inside Files: the search box while searching, otherwise the tree.
+  focusHome() {
+    if (this.query.trim()) { this.input.focus(); return; }
+    const rows = this.visible();
+    if (!rows.some(r => r.path === this.cursor)) this.cursor = rows[0]?.path ?? null;
+    this.handle.focus();
+  }
+
+  // Arrow keys (or j/k/h/l) walk the tree, Enter/Space open, / searches, Escape leaves.
+  treeKey(e, cx) {
+    const m = e.modifiers, k = e.key;
+    if (m.control || m.alt || m.platform) return;
+    const rows = this.visible();
+    let i = rows.findIndex(r => r.path === this.cursor);
+    const row = rows[i];
+    if (k === "escape") run("pane.go", { direction: "left" });
+    else if (k === "/") this.input.focus();
+    else if (!["down", "j", "up", "k", "home", "end", "right", "l", "left", "h", "enter", "space"].includes(k)) return;
+    else if (k === "up" && i <= 0) this.input.focus(); // above the first row: the search box
+    else if (!rows.length) { /* nothing listed yet */ }
+    else if (k === "down" || k === "j") i = Math.min(rows.length - 1, i + 1);
+    else if (k === "up" || k === "k") i = Math.max(0, i - 1);
+    else if (k === "home") i = 0;
+    else if (k === "end") i = rows.length - 1;
+    else if (!row) i = 0;
+    else if (k === "right" || k === "l") {
+      if (row.entry.dir && !this.folders.has(row.path)) this.toggle(row.path, cx);
+      else if (rows[i + 1]?.depth > row.depth) i++;
+    } else if (k === "left" || k === "h") {
+      if (row.entry.dir && this.folders.has(row.path)) this.toggle(row.path, cx);
+      else { const cut = row.path.lastIndexOf("/"); if (cut >= 0) i = rows.findIndex(r => r.path === row.path.slice(0, cut)); }
+    } else if (row.entry.dir) this.toggle(row.path, cx);
+    else this.show(row.path, cx);
+    if (rows[i]) { this.cursor = rows[i].path; this.treeScroll.scroll_to_item(i); }
+    cx.stop_propagation(); cx.notify();
+  }
+
+  rows(t) {
+    return this.visible().map(({ path, entry, depth }) => {
+      const open = this.folders.has(path), mark = this.marks[`${this.root}/${path}`];
+      return h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer()
+        .when(path === this.cursor, el => el.bg(t.selected)).hover(s => s.bg(t.hover))
+        .on_click((_e, cx) => { this.cursor = path; this.handle.focus(); entry.dir ? this.toggle(path, cx) : this.show(path, cx); cx.notify(); })
         .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.copyPath(path, cx); })
         .child(entry.dir ? svg(`mods/my-files/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
         .child(svg(`mods/my-files/${entry.dir ? "folder" : "file"}.svg`).size(14).flex_none().text_color(t.muted))
         .child(div().flex_1().min_w(0).truncate().child(entry.name))
-        .when(Boolean(mark), el => el.child(div().text_size(11).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark))));
-      if (entry.dir && open) this.rows(path, depth + 1, out, t);
-    }
-    return out;
+        .when(Boolean(mark), el => el.child(div().text_size(11).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark)));
+    });
   }
 
   hits(t) {
@@ -344,7 +438,12 @@ export default class Files extends View {
   render(cx) {
     if (key() !== this.context?.key) this.refresh(cx);
     const t = theme(), searching = !this.file && Boolean(this.query.trim());
-    return v_flex().id("files").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
+    return v_flex().id("files").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
+      .on_key_down((e, cx) => {
+        // Escape in a preview goes back to the tree, on the file it showed.
+        if (e.key === "escape" && this.file) { this.show(null); this.focusHome(); cx.stop_propagation(); cx.notify(); }
+        else if (!this.file && !searching && this.handle.is_focused()) this.treeKey(e, cx);
+      })
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .when(Boolean(this.file), el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => { this.show(null); cx.notify(); }).child("←")))
         .child(div().font_semibold().child("Files"))
@@ -355,6 +454,7 @@ export default class Files extends View {
           .on_key_down((e, cx) => {
             const n = this.results().length;
             if (e.key === "escape" && this.query) this.clearSearch(cx);
+            else if (e.key === "escape" || (e.key === "down" && !this.query.trim())) this.focusHome(); // into the tree
             else if (e.key === "down" && n) this.at = (this.at + 1) % n;
             else if (e.key === "up" && n) this.at = (this.at + n - 1) % n;
             else return;
@@ -365,7 +465,7 @@ export default class Files extends View {
           .child(Input.new(this.input).flex_1().h_full().text_size(12.5).text_color(t.foreground))
           .when(Boolean(this.query), el => el.child(div().id("files-clear").px(4).cursor_pointer().text_color(t.dim).hover(s => s.text_color(t.foreground)).on_click((_e, cx) => this.clearSearch(cx)).child("×")))))
       .when(searching, el => el.child(this.hits(t)))
-      .when(!this.file && !searching, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
+      .when(!this.file && !searching, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().track_scroll(this.treeScroll).p(6).children(this.rows(t))
         .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))
         .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total")))))
       .when(Boolean(this.file), el => el.child(this.code ? Editor.new(this.code).flex_1().min_h(0) : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…")));

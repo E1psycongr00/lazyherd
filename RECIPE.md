@@ -84,7 +84,16 @@ Left to right, top to bottom. Colors are theme tokens, so it follows any theme.
   respected, ≤10 matches per file, files ≤1 MB. Rows are 44px:
   `name:line`, folder, and the matching line in the terminal font.
 - **Keys in the search box**: ↑ / ↓ move the selection, Enter opens it,
-  Escape clears the search.
+  Escape clears the search; with an empty box, Escape or ↓ moves into the tree.
+- **Keyboard focus**: `mod.json` sets `"focusable": true`, so `pane.go`
+  (Alt+L from the rightmost pane) moves onto Files while it is shown. The
+  `"focus"` command from `nextCommand()` lands on the tree (the search box
+  while a search is open, the preview while one is open); Alt+H goes back.
+- **Keys in the tree**: a cursor row (`selected` background, also set by
+  clicks). ↑ / ↓ (j / k) move (↑ on the first row goes to the search box), Home / End jump, → (l) opens a folder or steps
+  into it, ← (h) closes it or steps to the parent, Enter / Space opens a
+  folder or previews a file, `/` goes to the search box, Escape goes back to
+  the terminals. Escape in a preview returns to the tree on that file.
 - **Right-click** any tree row, search result or the header path: copies the
   full path (backslashes on local Windows, quoted when it has spaces) and
   shows a "경로 복사됨" (path copied) toast. Paste it to an agent.
@@ -111,9 +120,13 @@ Left to right, top to bottom. Colors are theme tokens, so it follows any theme.
 - `mods/my-files/`: a clone of the shipped `files` mod (0.1.15) plus search
   and copy-path. Uses `spaces`, `panes`, `focused`, `exec`, `readTextFile`,
   `watchFolder`, `notify`; `Editor`, `Input`, `ScrollHandle` from gpui-base.
-  Runs `git` (ls-files, status, rev-parse), `rg` and, on Windows,
-  `powershell` (or `sh` elsewhere) to list folders. Reads only inside the
-  focused folder.
+  Runs `git` (ls-files, status, rev-parse), `rg` and, to list folders, `sh`
+  (macOS, Linux, remote) or, on Windows, `cmd`'s `dir` (~0.1 s; PowerShell
+  takes ~0.5 s to start). The `cmd` script is fixed text run in the folder,
+  with an inner `cmd` after `chcp 65001` so names come out as UTF-8; a folder
+  holding links or reparse points, or output that isn't UTF-8, falls back to
+  `powershell`. Closing a folder keeps its listing, so reopening shows it at
+  once and lists again. Reads only inside the focused folder.
 - `mods/usage/`: reads `~/.claude/usage-limits.json` with `readTextFile` and
   runs `codex-usage.ps1` with `exec("powershell", …)`; `watchFolder` tells it
   when either changed. Icons are Herdr's own
